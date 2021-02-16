@@ -1,0 +1,472 @@
+#include "hardware.h"
+#include "various.h"
+#include "hcsr04.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <avr/io.h>
+
+//******* Etiquetas *********************************//
+#define IR_FRAME_N		3
+#define XBEE_FRAME_N	5
+
+#define RX_TIME_OUT		50 //Cantidad de ciclos de para desvincular la comunicacion entre los autos una vez que se pierde la misma.
+
+#define WAIT		0
+#define START		1
+#define READ		2
+#define END			3	
+
+#define MOTOR_OFF	0
+#define MOTOR_ON	1
+#define MOTOR_STOP	2
+#define MOTOR_BRAKE	3
+
+#define IR_NACK		0
+#define IR_ACK		1
+
+#define SPIN_NONE	0
+
+#define HCSR04_STOP	200		//Distancia de parado: 20 cm
+#define HCSR04_OFF	230		//Distancia de apagado: 23 cm
+
+//****** Variables ********************************************//
+uint8_t	 x;
+volatile uint8_t irN, xbeeN;
+
+volatile union irFrame {
+	uint8_t vec[IR_FRAME_N];
+	struct {
+		uint8_t start, add, checksum;
+	};
+}irTx, irRx;
+
+volatile union xbeeFrame {
+	uint8_t vec[XBEE_FRAME_N];
+	struct {
+		uint8_t start, add, status, command, checksum;
+	};
+}xbeeTx, xbeeRx;
+
+struct {
+		uint8_t add, command, status, spin, mode, ir;
+}car;
+
+struct {
+		uint16_t value;
+		uint8_t error;
+}hcsr04;
+
+struct {
+		uint8_t rx, spin;
+}timer;
+
+
+//****** Funciones *************************//
+void put0(uint8_t data);
+void motor_on(void);
+void motor_off(void);
+void motor_reverse(void);
+void motor_stop(void);
+void motor_left(void);
+void motor_right(void);
+
+ISR(USART0_RX_vect)
+{
+	uint8_t checksum;
+
+	irRx.vec[irN] = UDR0;
+	if (irRx.vec[0] == 'I')
+		irN++;
+	else
+		irN = 0;
+	
+	if (irN >= IR_FRAME_N) {
+		checksum = 0;
+		for (uint8_t i = 0; i < (IR_FRAME_N-1); i++)
+			checksum ^= irRx.vec[i];
+
+		irRx.start = 0;
+		irN = 0;
+		
+		if (checksum == irRx.checksum) {
+			if (car.add != irRx.add)
+				car.ir = IR_ACK;		
+		}
+	}
+}
+
+ISR(USART1_RX_vect)
+{
+	uint8_t checksum;
+
+	xbeeRx.vec[xbeeN] = UDR1;
+	if (xbeeRx.vec[0] == 'I') 
+		xbeeN++;
+	else
+		xbeeN = 0;
+		
+	if (xbeeN >= XBEE_FRAME_N) {
+		checksum = 0;
+		for (uint8_t i = 0; i < (XBEE_FRAME_N-1); i++)
+			checksum ^= xbeeRx.vec[i];
+
+		xbeeRx.start = 0;
+		xbeeN = 0;
+		timer.rx = RX_TIME_OUT; //Mientras llegan paquetes se mantiene la conectividad
+		
+		if (checksum == xbeeRx.checksum) {
+			
+			if (car.add > xbeeRx.add) { //El auto con la direccion mas grande se define como maestro de la comunicacion. 
+				if (car.status != MOTOR_STOP) {
+					sbit(PORTC, 0);	//Se enciende el led identificador del auto
+					cbit(PORTC, 1);
+				}
+				if (xbeeRx.command == WAIT) { //Si el SLAVE envio un WAIT
+					xbeeTx.command = WAIT;
+					switch(car.mode) {
+						case 0:
+							car.mode = 1;
+							hcsr04.error = 0;
+						break;
+						case 1:
+							hcsr04.value = hcsr04_get();
+							if ((hcsr04.value > 0)&&(hcsr04.value < 4000))
+								car.mode = 2;
+							else
+								hcsr04.error++;
+							if (hcsr04.error >= 5)
+								car.mode = 2; 
+						break;
+						case 2:
+							xbeeTx.command = START;
+							car.mode = 0;
+						break;
+					}
+				}
+				if ((car.status == MOTOR_STOP)&&(xbeeRx.status == MOTOR_STOP))
+					car.spin = car.add;
+				else
+					car.spin = SPIN_NONE;
+			} else {
+					if (car.status != MOTOR_STOP) {
+						cbit(PORTC, 0); //Se enciende el led identificador del otro auto
+						sbit(PORTC, 1);
+					}
+					if (xbeeRx.command == START) {	//Si el MASTER evio un START, el SLAVE mide.
+						xbeeTx.command = READ;
+						hcsr04.value = hcsr04_get();
+						if ((hcsr04.value > 0)&&(hcsr04.value < 4000))
+							xbeeTx.command = WAIT;
+						else
+							hcsr04.error++;
+						if (hcsr04.error >= 5)
+							xbeeTx.command = WAIT;
+					}
+					else
+						hcsr04.error = 0;
+					if ((car.status == MOTOR_STOP)&&(xbeeRx.status == MOTOR_STOP))
+						car.spin = xbeeRx.add;
+					else
+						car.spin = SPIN_NONE;
+			}
+		}
+	}
+}
+
+ISR(INT0_vect)
+{
+	switch(car.status) {
+		case MOTOR_OFF:
+			for (uint8_t i = 0; i < 20; i++) {
+				sbit(PORTC,0);
+				_delay_ms(50);
+				cbit(PORTC,0);
+				_delay_ms(50);
+			}
+			car.status = MOTOR_ON;
+			motor_on();
+		break;
+		
+		case MOTOR_ON:
+			car.status = MOTOR_OFF;
+			motor_off();
+		break;
+	}
+}
+	
+
+int main (void)
+{
+	/********* Registros ************************************/
+	MCUSR=0;	//Reseteo de registros
+	
+	/********* Motores **************************************/
+	ICR1 = 60000;
+	TCCR1A |= (1 << COM1A1)|(1 << COM1B1)|(1 << COM1A0)|(1 << COM1B0);
+	TCCR1A |= (1 << WGM11);
+	TCCR1B |= (1 << WGM12)|(1 << WGM13);
+	sbit(DDRC,2);
+	sbit(DDRC,3);
+	sbit(PORTC,2);
+	sbit(PORTC,3);
+	OCR1A = 0; //Rueda derecha
+	OCR1B = 0; //Rueda izquierda
+	
+	/********* Led RGB **************************************/
+	sbit(DDRD, 3);	//Rojo
+	sbit(DDRC, 0);	//ID 1
+	sbit(DDRC, 1);	//ID 2
+	cbit(PORTD, 3);	//Rojo
+	cbit(PORTC, 0); //ID 1
+	cbit(PORTC, 1);	//ID 2
+
+	/********* Pulsador ************************************/
+	sbit(EIMSK, 0);	//Interrupcion INT0 activada
+	sbit(EICRA, 0); //Interrupcion por flanco ascendente EICRA = 0000xx11
+	sbit(EICRA, 1); //Interrupcion por flanco ascendente
+	
+	/******** Comunicacion UART 0 (IR) ****************************/
+	usart0_init(1200, USART_0_8N1);
+	usart0_rx_on();
+	interruption_on(USART_0);
+	sbit(DDRD, 1); //Tx
+	
+	/******** Comunicacion UART 1 (Xbee) ****************************/
+	usart1_init(57600, USART_0_8N1);
+	usart1_rx_on();
+	usart1_tx_on();
+	interruption_on(USART_1);
+
+	/******** HCSR04 ***************************************/
+	hcsr04_init();
+
+	/******** Baliza de inicio de programa *****************/
+	for (uint8_t i = 0; i < 5; i++) {
+		sbit(PORTC,0);
+		_delay_ms(50);
+		cbit(PORTC,0);
+		_delay_ms(50);
+	} 
+	
+	/**** Puerto del control de los motores habilitados ****/
+	DDRB |= (1 << DDB1)|(1 << DDB2);
+
+	/******** Se inicia la estructura "car" *************/
+	adc_init(ADC_AREF, ADC_RIGHT, ADC_SINGLE_CONVERTION, 128);
+	adc_on();
+	_delay_ms(10);
+	adc_channel(5);
+	_delay_ms(10);
+	for (uint8_t i = 0;i < 100;i++) {
+		_delay_ms(1);
+		car.add += adc_get();
+	}
+
+	adc_off();
+	car.command = WAIT;	
+	car.status = MOTOR_OFF;
+	car.spin = SPIN_NONE;
+	car.mode = 0;
+	car.ir = IR_NACK;
+	
+	/******** Inicio estructura "xbee" *************/
+	xbeeTx.start = 'I';
+	xbeeTx.add = car.add;
+	xbeeTx.command = WAIT;
+
+	irTx.start = 'I';
+	irTx.add = car.add;
+	
+	timer.rx = 0;
+	timer.spin = 0;
+
+	/******** Interrupcines globales habilitadas ***********/
+	sei();
+	_delay_ms(10);
+	
+	while(1)
+	{
+
+//		_delay_ms(25);
+		
+		xbeeTx.checksum = 0;
+		for (uint8_t i = 0; i < XBEE_FRAME_N; i++) {
+			putc1(xbeeTx.vec[i]);
+			if (i < (XBEE_FRAME_N - 1))
+				xbeeTx.checksum ^= xbeeTx.vec[i];
+		}
+		_delay_ms(50);
+		
+		//*********** Medicion de distancia **********************************/
+		if (car.command == START) { 
+			hcsr04.value = hcsr04_get();
+			car.command = WAIT; //Si concreto correctamente la medida, el auto entra en modo espera		
+		}
+		
+		
+		if ((hcsr04.value > 0)&&(hcsr04.value < 4000)) { //Medicion correcta
+			if (hcsr04.value <= HCSR04_STOP) //Distancia de parada
+				car.status = MOTOR_STOP;
+			if (hcsr04.value >= HCSR04_OFF) //Si la distancia es mayor a HCSR04_OFF y esta parado, pasa a modo apagado (OFF).
+				if (car.status == MOTOR_STOP)
+					car.status = MOTOR_OFF;
+		}
+		/*************************************************************************************/
+
+		//*********** STATUS **********************************/
+		cbit(PORTD,3);
+		xbeeTx.status = car.status;
+		if (car.status != MOTOR_ON) { //Si el auto esta apagado o parado, se apagan los motores
+			motor_off();			
+			if ((car.status == MOTOR_STOP)||(car.status == MOTOR_BRAKE)) { //Si esta parado, se enciende el led rojo
+				sbit(PORTD,3);
+				cbit(PORTC,0);
+				cbit(PORTC,1); 
+			}
+		 }
+		/*************************************************************************************/
+			
+		//*********** Giro **********************************/
+		if (car.spin != SPIN_NONE) { 
+			if (timer.spin == 0)
+				timer.spin = 30;
+			else
+				timer.spin--;
+			
+			irTx.checksum = 0;
+			_delay_ms(10);
+			for (uint8_t i = 0; i < IR_FRAME_N; i++) {
+				put0(irTx.vec[i]);
+				if (i < (IR_FRAME_N - 1))
+					irTx.checksum ^= irTx.vec[i];
+			}
+			
+			if (timer.spin < 3) {
+				timer.spin = 0;
+				if (car.ir == IR_ACK) {
+					cbit(PORTD, 3);
+					motor_reverse();
+					_delay_ms(500);
+					if (car.spin == car.add)
+						motor_left();
+					else
+						motor_right();
+					_delay_ms(1000);
+					motor_off();
+					_delay_ms(500);
+					motor_on();
+					_delay_ms(2000);
+					motor_off();
+				}
+				car.ir = IR_NACK;
+				car.spin = SPIN_NONE;
+				car.status = MOTOR_OFF;
+			}
+		}
+		/*************************************************************************************/
+		
+		//*********** Tiempo de espera sin que lleguen paquetes ******************//
+		if (timer.rx > 0)
+			timer.rx--;
+		else {
+			cbit(PORTC,0);
+			cbit(PORTC,1);
+			car.command = START;
+			car.ir = IR_NACK;
+			xbeeTx.command = WAIT;
+			timer.spin = 0;
+		}
+		/*************************************************************************************/
+
+		x = 0;	
+	}
+}
+
+void motor_on(void) {
+	OCR1A = 35000;
+	OCR1B = 35000;
+	_delay_ms(40);
+	OCR1A = 15000;
+	OCR1B = 15000; 
+}
+
+void motor_off(void) {
+	OCR1A = 0;
+	OCR1B = 0;
+	sbit(PORTC,2);
+	sbit(PORTC,3);
+}
+
+void motor_right(void) {
+	OCR1A = 0;
+	OCR1B = 30000;
+}
+
+void motor_left(void) {
+	OCR1A = 30000;
+	OCR1B = 0;
+}
+
+void motor_reverse(void) {
+	OCR1A = 0;
+	OCR1B = 0;
+	cbit(PORTC,2);
+	cbit(PORTC,3);
+	_delay_ms(30);
+	for (uint8_t i = 0; i < 150; i++)
+	{
+		
+		cbit(PORTC,2);
+		cbit(PORTC,3);
+		_delay_ms(4);
+		sbit(PORTC,2);
+		_delay_us(150);
+		sbit(PORTC,3);
+		_delay_us(850);
+		_delay_ms(15);
+	}
+}
+
+
+void motor_stop(void) {
+
+	OCR1A = 0;
+	OCR1B = 0;
+	cbit(PORTC,2);
+	cbit(PORTC,3);
+	_delay_ms(30);
+	for (uint8_t i = 0; i < 10; i++)
+	{
+		
+		cbit(PORTC,2);
+		cbit(PORTC,3);
+		_delay_ms(4);
+		sbit(PORTC,2);
+		_delay_us(150);
+		sbit(PORTC,3);
+		_delay_us(850);
+		_delay_ms(15);
+	}
+	
+	//_delay_ms(10);
+/*	cbit(PORTC,2);
+	cbit(PORTC,3);
+	_delay_ms(20);
+	sbit(PORTC,2);
+	sbit(PORTC,3);*/
+}
+
+void put0(uint8_t d) {
+	sbit(PORTD,1); // 10ms
+	_delay_us(833);
+	for (uint8_t i = 0; i < 8; i++)
+	{
+		if ((d>>i)&1)
+			cbit(PORTD,1);
+		else
+			sbit(PORTD,1);
+		_delay_us(833);
+	}
+	cbit(PORTD,1);
+	_delay_us(2503);
+}
